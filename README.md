@@ -1,4 +1,4 @@
-# FiveM-Event-Logger
+# [STAND-ALONE] FiveM-Event-Logger
 Something terrible, it doesn't even register the source id's because dealing with the Internal FiveM system is such a pain in the ass.
 
 Registers everything in the console, lightweight script
