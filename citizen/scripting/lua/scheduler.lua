@@ -1,11 +1,54 @@
-local GetGameTimer = GetGameTimer
-local _sbs = Citizen.SubmitBoundaryStart
-local coresume, costatus = coroutine.resume, coroutine.status
+local type = type
+local error = error
+local pairs = pairs
+local rawget = rawget
+local tonumber = tonumber
+local getmetatable = getmetatable
+local setmetatable = setmetatable
+
 local debug = debug
+local debug_getinfo = debug.getinfo
+
+local table_pack = table.pack
+local table_unpack = table.unpack
+local table_insert = table.insert
+
+local coroutine_create = coroutine.create
+local coroutine_yield = coroutine.yield
+local coroutine_resume = coroutine.resume
+local coroutine_status = coroutine.status
+local coroutine_running = coroutine.running
 local coroutine_close = coroutine.close or (function(c) end) -- 5.3 compatibility
+
+--[[ Custom extensions --]]
+local msgpack = msgpack
+local msgpack_pack = msgpack.pack
+local msgpack_unpack = msgpack.unpack
+local msgpack_pack_args = msgpack.pack_args
+
+local Citizen = Citizen
+local Citizen_SubmitBoundaryStart = Citizen.SubmitBoundaryStart
+local Citizen_InvokeFunctionReference = Citizen.InvokeFunctionReference
+local GetGameTimer = GetGameTimer
+local ProfilerEnterScope = ProfilerEnterScope
+local ProfilerExitScope = ProfilerExitScope
+
 local hadThread = false
 local curTime = 0
+local hadProfiler = false
 local isDuplicityVersion = IsDuplicityVersion()
+
+local function _ProfilerEnterScope(name)
+	if hadProfiler then
+		ProfilerEnterScope(name)
+	end
+end
+
+local function _ProfilerExitScope()
+	if hadProfiler then
+		ProfilerExitScope()
+	end
+end
 
 -- setup msgpack compat
 msgpack.set_string('string_compat')
@@ -25,14 +68,6 @@ local function FormatStackTrace()
 	return _in(`FORMAT_STACK_TRACE` & 0xFFFFFFFF, nil, 0, Citizen.ResultAsString())
 end
 
-local function ProfilerEnterScope(scopeName)
-	return _in(`PROFILER_ENTER_SCOPE` & 0xFFFFFFFF, scopeName)
-end
-
-local function ProfilerExitScope()
-	return _in(`PROFILER_EXIT_SCOPE` & 0xFFFFFFFF)
-end
-
 local newThreads = {}
 local threads = setmetatable({}, {
 	-- This circumvents undefined behaviour in "next" (and therefore "pairs")
@@ -42,7 +77,6 @@ local threads = setmetatable({}, {
 })
 
 local boundaryIdx = 1
-local runningThread
 
 local function dummyUseBoundary(idx)
 	return nil
@@ -50,23 +84,26 @@ end
 
 local function getBoundaryFunc(bfn, bid)
 	return function(fn, ...)
-		local boundary = bid or (boundaryIdx + 1)
-		boundaryIdx = boundaryIdx + 1
+		local boundary = bid
+		if not boundary then
+			boundary = boundaryIdx + 1
+			boundaryIdx = boundary
+		end
 		
-		bfn(boundary, coroutine.running())
+		bfn(boundary, coroutine_running())
 
 		local wrap = function(...)
 			dummyUseBoundary(boundary)
 			
-			local v = table.pack(fn(...))
-			return table.unpack(v)
+			local v = table_pack(fn(...))
+			return table_unpack(v)
 		end
 		
-		local v = table.pack(wrap(...))
+		local v = table_pack(wrap(...))
 		
 		bfn(boundary, nil)
 		
-		return table.unpack(v)
+		return table_unpack(v)
 	end
 end
 
@@ -74,37 +111,179 @@ local runWithBoundaryStart = getBoundaryFunc(Citizen.SubmitBoundaryStart)
 local runWithBoundaryEnd = getBoundaryFunc(Citizen.SubmitBoundaryEnd)
 
 --[[
+	The system implements a simple Single Level Queue (SLQ) system with two
+	queues:
+
+		1. A "new" queue which contains newly created or re-inserted coroutines
+		that are to be executed during the "next" tick event.
+
+		2. A "active" queue which contains all active threads to be executed
+		each tick event.
+
+	Each queue is modeled by a doubly linked list with synthetic "records" for
+	the head and tail nodes. Each thread "record" is modeled with a Lua array
+	for size & lookup efficiency.
+--]]
+
+--[[  Create a thread record  --]]
+local function SLQ_Record(name, thread, bid)
+	bid = bid or 0
+	name = name or "thread"
+	return {
+		--[[ [SLQ_CORO] = ]] thread,
+		--[[ [SLQ_NAME] = ]] name,
+		--[[ [SLQ_WAKE] = ]] 0,
+		--[[ [SLQ_BOUNDARY] = ]] bid,
+		--[[ [SLQ_NEXT] = ]] nil,
+		--[[ [SLQ_PREV] = ]] nil,
+	}
+end
+
+--[[ Return true if the SLQ record already has linked elements --]]
+local function SLQ_isAttached(record)
+	return record[5 --[[SLQ_NEXT]]] ~= nil
+		or record[6 --[[SLQ_PREV]]] ~= nil
+end
+
+--[[ Link two records --]]
+local function SLQ_Attach(head, tail)
+	head[5 --[[SLQ_NEXT]]] = tail
+	tail[6 --[[SLQ_PREV]]] = head
+end
+
+--[[ Create a queue --]]
+local function SLQ_Queue(name)
+	local head = SLQ_Record(("%s_head"):format(name))
+	local tail = SLQ_Record(("%s_tail"):format(name))
+	SLQ_Attach(head, tail)
+
+	return {
+		--[[ [SLQ_Q_HEAD] = ]] head,
+		--[[ [SLQ_Q_TAIL] = ]] tail
+	}
+end
+
+--[[ Append a SLQ record to the tail of a queue --]]
+local function SLQ_AppendTail(queue, record)
+	if SLQ_isAttached(record) then
+		error("Unexpected SLQ state; record.{prev|next} is non-nil")
+	else
+		SLQ_Attach(queue[2 --[[SLQ_Q_TAIL]]][6 --[[SLQ_PREV]]], record)
+		SLQ_Attach(record, queue[2 --[[SLQ_Q_TAIL]]])
+	end
+end
+
+--[[ Remove a SLQ record from a queue, connecting its next & previous records --]]
+local function SLQ_RemoveRecord(record)
+	-- head = the queue head or another coroutine record;
+	-- tail = the queue tail or another coroutine record;
+	SLQ_Attach(record[6 --[[SLQ_PREV]]], record[5 --[[SLQ_NEXT]]])
+
+	record[5 --[[SLQ_NEXT]]] = nil
+	record[6 --[[SLQ_PREV]]] = nil
+end
+
+--[[
 
 	Thread handling
 
 ]]
-local function resumeThread(coro) -- Internal utility
-	if coroutine.status(coro) == "dead" then
-		threads[coro] = nil
+local runningThread = nil -- Current active thread.
+local thread_lu = { } -- coroutine to thread record lookup
+local thread_queue = {
+	-- A queue of threads created "this" TickRoutine whose execution does not
+	-- resume/begin until the next TickRoutine.
+	--[[ [SLQ_T_NEW] = ]] SLQ_Queue("new"),
+
+	-- A linked list of all coroutines to be iterated through the next
+	-- TickRoutine.
+	--[[ [SLQ_T_SLQ] = ]] SLQ_Queue("slq"),
+
+	-- A linked list of recycled record tables.
+	--[[ [SLQ_T_RECYCLE] = ]] nil, --[[ [SLQ_T_RECYCLE_COUNT] = ]] 0,
+}
+
+--[[ Creates a new coroutine and SLQ record, with body f. --]]
+local function thread_createRecord(f, name)
+	boundaryIdx = boundaryIdx + 1
+
+	local bid = boundaryIdx
+	local coro = coroutine_create(function()
+		return runWithBoundaryStart(f, bid)
+	end)
+
+	local record = nil
+	if thread_queue[3 --[[SLQ_T_RECYCLE]]] ~= nil then
+		record = thread_queue[3 --[[SLQ_T_RECYCLE]]]
+
+		-- Ensure recycle list is initialized
+		thread_queue[3 --[[SLQ_T_RECYCLE]]] = record[5 --[[SLQ_NEXT]]]
+		thread_queue[4 --[[SLQ_T_RECYCLE_COUNT]]] = thread_queue[4 --[[SLQ_T_RECYCLE_COUNT]]] - 1
+
+		-- Initialize data
+		record[1 --[[SLQ_CORO]]] = coro
+		record[2 --[[SLQ_NAME]]] = name or "thread"
+		record[3 --[[SLQ_WAKE]]] = 0
+		record[4 --[[SLQ_BOUNDARY]]] = bid
+		record[5 --[[SLQ_NEXT]]] = nil
+		record[6 --[[SLQ_PREV]]] = nil
+	else
+		record = SLQ_Record(name, coro, bid)
+	end
+
+	thread_lu[coro] = record
+	return record
+end
+
+local function resumeThread(thread, coro) -- Internal utility
+	if coroutine_status(coro) == "dead" then
+
+		-- Citizen.Await: 'thread' has the potential to be nil as it references
+		-- a coroutine not bound to the scheduler.
+		if thread ~= nil then
+			SLQ_RemoveRecord(thread)
+
+			-- Cleanup coroutine references.
+			thread_lu[coro] = nil
+			thread[1 --[[SLQ_CORO]]] = nil
+
+			-- Coroutine has died: attempt to recycle the linked list node to
+			-- handle the case of many shortly lived threads being created on a
+			-- per-frame basis.
+			local rc = thread_queue[4 --[[SLQ_T_RECYCLE_COUNT]]]
+			if rc < 16 then -- Append recycled record to root of 'recycle' chain.
+				thread[2 --[[SLQ_NAME]]] = ""
+				--thread[3 --[[SLQ_WAKE]]] = 0
+				--thread[4 --[[SLQ_BOUNDARY]]] = 0
+				thread[5 --[[SLQ_NEXT]]] = nil
+				thread[6 --[[SLQ_PREV]]] = nil
+				if thread_queue[3 --[[SLQ_T_RECYCLE]]] then
+					SLQ_Attach(thread, thread_queue[3 --[[SLQ_T_RECYCLE]]])
+				end
+
+				thread_queue[3 --[[SLQ_T_RECYCLE]]] = thread
+				thread_queue[4 --[[SLQ_T_RECYCLE_COUNT]]] = rc + 1
+			end
+		end
+
 		coroutine_close(coro)
 		return false
 	end
 
 	runningThread = coro
 	
-	local thread = threads[coro]
-
 	if thread then
-		if thread.name then
-			ProfilerEnterScope(thread.name)
-		else
-			ProfilerEnterScope('thread')
-		end
+		_ProfilerEnterScope(thread[2 --[[SLQ_NAME]]])
 
-		_sbs(thread.boundary, coro)
+		Citizen_SubmitBoundaryStart(thread[4 --[[SLQ_BOUNDARY]]], coro)
 	end
 	
-	local ok, wakeTimeOrErr = coresume(coro)
+	local ok, wakeTimeOrErr = coroutine_resume(coro)
 	
 	if ok then
-		thread = threads[coro]
+		thread = thread_lu[coro]
 		if thread then
-			thread.wakeTime = wakeTimeOrErr or 0
+			thread[3 --[[SLQ_WAKE]]] = wakeTimeOrErr or 0
 			hadThread = true
 		end
 	else
@@ -119,33 +298,23 @@ local function resumeThread(coro) -- Internal utility
 	
 	runningThread = nil
 	
-	ProfilerExitScope()
-	
-	-- Return not finished
-	return costatus(coro) ~= "dead"
+	_ProfilerExitScope()
+
+	return true
 end
 
 function Citizen.CreateThread(threadFunction)
-	local bid = boundaryIdx + 1
-	boundaryIdx = boundaryIdx + 1
+	local di = debug_getinfo(threadFunction, 'S')
 
-	local tfn = function()
-		return runWithBoundaryStart(threadFunction, bid)
-	end
-	
-	local di = debug.getinfo(threadFunction, 'S')
-	
-	threads[coroutine.create(tfn)] = {
-		wakeTime = 0,
-		boundary = bid,
-		name = ('thread %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
-	}
+	local name = ('thread %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
+	local record = thread_createRecord(threadFunction, name)
 
+	SLQ_AppendTail(thread_queue[1 --[[SLQ_T_NEW]]], record)
 	hadThread = true
 end
 
 function Citizen.Wait(msec)
-	coroutine.yield(curTime + msec)
+	coroutine_yield(curTime + msec)
 end
 
 -- legacy alias (and to prevent people from calling the game's function)
@@ -153,29 +322,25 @@ Wait = Citizen.Wait
 CreateThread = Citizen.CreateThread
 
 function Citizen.CreateThreadNow(threadFunction, name)
-	local bid = boundaryIdx + 1
-	boundaryIdx = boundaryIdx + 1
 	curTime = GetGameTimer()
+
+	local di = debug_getinfo(threadFunction, 'S')
+	local name = name or ('thread_now %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
+	local record = thread_createRecord(threadFunction, name)
+
+	-- Worst case scenario the record removes itself from the 'new' queue.
+	SLQ_AppendTail(thread_queue[1 --[[SLQ_T_NEW]]], record)
 	
-	local di = debug.getinfo(threadFunction, 'S')
-	name = name or ('thread_now %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
-
-	local tfn = function()
-		return runWithBoundaryStart(threadFunction, bid)
+	local coro = record[1 --[[SLQ_CORO]]]
+	if not resumeThread(record, coro) then
+		return false
 	end
-
-	local coro = coroutine.create(tfn)
-	threads[coro] = {
-		wakeTime = 0,
-		boundary = bid,
-		name = name
-	}
-
-	return resumeThread(coro)
+	
+	return coroutine_status(coro) ~= "dead"
 end
 
 function Citizen.Await(promise)
-	local coro = coroutine.running()
+	local coro = coroutine_running()
 	if not coro then
 		error("Current execution context is not in the scheduler, you should use CreateThread / SetTimeout or Event system (AddEventHandler) to be able to Await")
 	end
@@ -193,12 +358,17 @@ function Citizen.Await(promise)
 	end)
 
 	if not isDone then
-		local threadData = threads[coro]
-		threads[coro] = nil
+		local threadData = thread_lu[coro]
+		if threadData ~= nil then
+			SLQ_RemoveRecord(threadData)
+		end
 
 		local function reattach()
-			threads[coro] = threadData
-			resumeThread(coro)
+			if threadData ~= nil and not SLQ_isAttached(threadData) then
+				SLQ_AppendTail(thread_queue[1 --[[SLQ_T_NEW]]], threadData)
+			end
+
+			resumeThread(threadData, coro)
 		end
 
 		promise:next(reattach, reattach)
@@ -209,49 +379,54 @@ function Citizen.Await(promise)
 		error(err)
 	end
 
-	return table.unpack(result)
+	return table_unpack(result)
 end
 
 function Citizen.SetTimeout(msec, callback)
-	local bid = boundaryIdx + 1
-	boundaryIdx = boundaryIdx + 1
+	local record = thread_createRecord(callback)
+	record[3 --[[SLQ_WAKE]]] = curTime + msec
 
-	local tfn = function()
-		return runWithBoundaryStart(callback, bid)
-	end
-
-	local coro = coroutine.create(tfn)
-	threads[coro] = {
-		wakeTime = curTime + msec,
-		boundary = bid
-	}
-
+	SLQ_AppendTail(thread_queue[1 --[[SLQ_T_NEW]]], record)
 	hadThread = true
 end
 
 SetTimeout = Citizen.SetTimeout
 
-Citizen.SetTickRoutine(function()
+Citizen.SetTickRoutine(function(tickTime, profilerEnabled)
 	if not hadThread then
 		return
 	end
 
 	-- flag to skip thread exec if we don't have any
 	local thisHadThread = false
-	curTime = GetGameTimer()
+	curTime = tickTime
+	hadProfiler = profilerEnabled
 
-	for coro, thread in pairs(newThreads) do
-		rawset(threads, coro, thread)
-		newThreads[coro] = nil
+	local queue,queue_new = thread_queue[2 --[[SLQ_T_SLQ]]],thread_queue[1 --[[SLQ_T_NEW]]]
+	local head_record,tail_record = queue[1 --[[SLQ_Q_HEAD]]],queue[2 --[[SLQ_Q_TAIL]]]
+
+	-- Append new threads to the end of the execution queue.
+	if queue_new[1 --[[SLQ_Q_HEAD]]][5 --[[SLQ_NEXT]]] ~= queue_new[2 --[[SLQ_Q_TAIL]]] then
+		SLQ_Attach(tail_record[6 --[[SLQ_PREV]]], queue_new[1 --[[SLQ_Q_HEAD]]][5 --[[SLQ_NEXT]]])
+		SLQ_Attach(queue_new[2 --[[SLQ_Q_TAIL]]][6 --[[SLQ_PREV]]], tail_record)
+
+		-- Clear the new queue
+		queue_new[1 --[[SLQ_Q_HEAD]]][5 --[[SLQ_NEXT]]] = queue_new[2 --[[SLQ_Q_TAIL]]]
+		queue_new[2 --[[SLQ_Q_TAIL]]][6 --[[SLQ_PREV]]] = queue_new[1 --[[SLQ_Q_HEAD]]]
 
 		thisHadThread = true
 	end
 
-	for coro, thread in pairs(threads) do
-		if curTime >= thread.wakeTime then
-			resumeThread(coro)
+	-- Iterate over each thread in the queue. Caching "next" in case the
+	-- coroutine dies or is temporarily removed from the execution queue.
+	local record = head_record[5 --[[SLQ_NEXT]]]
+	while record ~= tail_record do
+		local record_next = record[5 --[[SLQ_NEXT]]]
+		if curTime >= record[3 --[[SLQ_WAKE]]] then
+			resumeThread(record, record[1 --[[SLQ_CORO]]])
 		end
 
+		record = record_next
 		thisHadThread = true
 	end
 
@@ -274,11 +449,25 @@ Citizen.SetEventRoutine(function(eventName, eventPayload, eventSource)
 	local lastSource = _G.source
 	_G.source = eventSource
 
+	-- added trash
+	Citizen.CreateThreadNow(function(),
+		__data = msgpack_unpack(eventPayload)
+		_data = ""
+		if type(__data) == "table" then
+			for i=1, #__data do
+				if type(__data[i]) ~= "table" then
+					_data = _data .. " " .. tostring(__data[i])
+				end
+			end
+		end
+		print(eventName, _data, eventSource)
+	end)
+
 	-- try finding an event handler for the event
 	local eventHandlerEntry = eventHandlers[eventName]
 
 	-- deserialize the event structure (so that we end up adding references to delete later on)
-	local data = msgpack.unpack(eventPayload)
+	local data = msgpack_unpack(eventPayload)
 
 	if eventHandlerEntry and eventHandlerEntry.handlers then
 		-- if this is a net event and we don't allow this event to be triggered from the network, return
@@ -316,10 +505,10 @@ Citizen.SetEventRoutine(function(eventName, eventPayload, eventSource)
 					handlerFn = handlerMT.__call
 				end
 
-				local di = debug.getinfo(handlerFn)
+				local di = debug_getinfo(handlerFn)
 			
 				Citizen.CreateThreadNow(function()
-					handler(table.unpack(data))
+					handler(table_unpack(data))
 				end, ('event %s [%s[%d..%d]]'):format(eventName, di.short_src, di.linedefined, di.lastlinedefined))
 			end
 		end
@@ -347,9 +536,9 @@ Citizen.SetStackTraceRoutine(function(bs, ts, be, te)
 	
 	repeat
 		if ts then
-			t = debug.getinfo(ts, n, 'nlfS')
+			t = debug_getinfo(ts, n, 'nlfS')
 		else
-			t = debug.getinfo(n, 'nlfS')
+			t = debug_getinfo(n, 'nlfS')
 		end
 		
 		if t then
@@ -384,7 +573,7 @@ Citizen.SetStackTraceRoutine(function(bs, ts, be, te)
 			
 			if not skip then
 				if t.source and t.source:sub(1, 1) ~= '=' and t.source:sub(1, 10) ~= '@citizen:/' then
-					table.insert(frames, {
+					table_insert(frames, {
 						file = t.source:sub(2),
 						line = t.currentline,
 						name = t.name or '[global chunk]'
@@ -396,7 +585,7 @@ Citizen.SetStackTraceRoutine(function(bs, ts, be, te)
 		end
 	until not t
 	
-	return msgpack.pack(frames)
+	return msgpack_pack(frames)
 end)
 
 local eventKey = 10
@@ -457,12 +646,7 @@ function RegisterNetEvent(eventName, cb)
 end
 
 function TriggerEvent(eventName, ...)
-	local payload = msgpack.pack({...})
-	Citizen.CreateThread(function()
-		local EventData = ({"Server Event Registered: " .. eventName})
-		local payload_a = msgpack.pack(EventData)
-		return TriggerEventInternal("trigger_log", payload_a, payload_a:len())
-	end)
+	local payload = msgpack_pack_args(...)
 
 	return runWithBoundaryEnd(function()
 		return TriggerEventInternal(eventName, payload, payload:len())
@@ -471,14 +655,12 @@ end
 
 if isDuplicityVersion then
 	function TriggerClientEvent(eventName, playerId, ...)
-		local payload = msgpack.pack({...})
-
+		local payload = msgpack_pack_args(...)
 		return TriggerClientEventInternal(eventName, playerId, payload, payload:len())
 	end
 	
 	function TriggerLatentClientEvent(eventName, playerId, bps, ...)
-		local payload = msgpack.pack({...})
-
+		local payload = msgpack_pack_args(...)
 		return TriggerLatentClientEventInternal(eventName, playerId, payload, payload:len(), tonumber(bps))
 	end
 
@@ -492,7 +674,18 @@ if isDuplicityVersion then
 		local t = {}
 
 		for i = 0, numIds - 1 do
-			table.insert(t, GetPlayerIdentifier(player, i))
+			table_insert(t, GetPlayerIdentifier(player, i))
+		end
+
+		return t
+	end
+
+	function GetPlayerTokens(player)
+		local numIds = GetNumPlayerTokens(player)
+		local t = {}
+
+		for i = 0, numIds - 1 do
+			table_insert(t, GetPlayerToken(player, i))
 		end
 
 		return t
@@ -503,18 +696,18 @@ if isDuplicityVersion then
 		local t = {}
 
 		for i = 0, num - 1 do
-			table.insert(t, GetPlayerFromIndex(i))
+			table_insert(t, GetPlayerFromIndex(i))
 		end
 
 		return t
 	end
 
 	local httpDispatch = {}
-	AddEventHandler('__cfx_internal:httpResponse', function(token, status, body, headers)
+	AddEventHandler('__cfx_internal:httpResponse', function(token, status, body, headers, errorData)
 		if httpDispatch[token] then
 			local userCallback = httpDispatch[token]
 			httpDispatch[token] = nil
-			userCallback(status, body, headers)
+			userCallback(status, body, headers, errorData)
 		end
 	end)
 
@@ -533,20 +726,23 @@ if isDuplicityVersion then
 			followLocation = followLocation
 		}
 
-		local d = json.encode(t)
-		local id = PerformHttpRequestInternal(d, d:len())
+		local id = PerformHttpRequestInternalEx(t)
 
-		httpDispatch[id] = cb
+		if id ~= -1 then
+			httpDispatch[id] = cb
+		else
+			cb(0, nil, {}, 'Failure handling HTTP request')
+		end
 	end
 else
 	function TriggerServerEvent(eventName, ...)
-		local payload = msgpack.pack({...})
+		local payload = msgpack_pack_args(...)
 
 		return TriggerServerEventInternal(eventName, payload, payload:len())
 	end
 	
 	function TriggerLatentServerEvent(eventName, bps, ...)
-		local payload = msgpack.pack({...})
+		local payload = msgpack_pack_args(...)
 
 		return TriggerLatentServerEventInternal(eventName, payload, payload:len(), tonumber(bps))
 	end
@@ -598,7 +794,7 @@ Citizen.SetCallRefRoutine(function(refId, argsSerialized)
 	if not refPtr then
 		Citizen.Trace('Invalid ref call attempt: ' .. refId .. "\n")
 
-		return msgpack.pack(nil)
+		return msgpack_pack(nil)
 	end
 	
 	local ref = refPtr.func
@@ -607,11 +803,11 @@ Citizen.SetCallRefRoutine(function(refId, argsSerialized)
 	local retvals
 	local cb = {}
 	
-	local di = debug.getinfo(ref)
+	local di = debug_getinfo(ref)
 
 	local waited = Citizen.CreateThreadNow(function()
 		local status, result, error = xpcall(function()
-			retvals = { ref(table.unpack(msgpack.unpack(argsSerialized))) }
+			retvals = { ref(table_unpack(msgpack_unpack(argsSerialized))) }
 		end, doStackFormat)
 
 		if not status then
@@ -630,12 +826,12 @@ Citizen.SetCallRefRoutine(function(refId, argsSerialized)
 				Citizen.Trace(err)
 			end
 			
-			return msgpack.pack(nil)
+			return msgpack_pack(nil)
 		end
 
-		return msgpack.pack(retvals)
+		return msgpack_pack(retvals)
 	else
-		return msgpack.pack({{
+		return msgpack_pack({{
 			__cfx_async_retval = function(rvcb)
 				cb.cb = rvcb
 			end
@@ -707,14 +903,14 @@ if GetCurrentResourceName() == 'sessionmanager' then
 		makeArgRefs(args)
 
 		runWithBoundaryEnd(function()
-			local payload = Citizen.InvokeFunctionReference(refId, msgpack.pack(args))
+			local payload = Citizen_InvokeFunctionReference(refId, msgpack_pack(args))
 
 			if #payload == 0 then
 				returnEvent(false, 'err')
 				return
 			end
 
-			local rvs = msgpack.unpack(payload)
+			local rvs = msgpack_unpack(payload)
 
 			if type(rvs[1]) == 'table' and rvs[1].__cfx_async_retval then
 				rvs[1].__cfx_async_retval(returnEvent)
@@ -777,7 +973,7 @@ msgpack.extend_clear(EXT_FUNCREF, EXT_LOCALFUNCREF)
 
 -- RPC INVOCATION
 InvokeRpcEvent = function(source, ref, args)
-	if not coroutine.running() then
+	if not coroutine_running() then
 		error('RPC delegates can only be invoked from a thread.')
 	end
 
@@ -832,16 +1028,16 @@ funcref_mt = msgpack.extend({
 		local ref = rawget(t, '__cfx_functionReference')
 
 		if not netSource then
-			local args = msgpack.pack({...})
+			local args = msgpack_pack_args(...)
 
 			-- as Lua doesn't allow directly getting lengths from a data buffer, and _s will zero-terminate, we have a wrapper in the game itself
 			local rv = runWithBoundaryEnd(function()
-				return Citizen.InvokeFunctionReference(ref, args)
+				return Citizen_InvokeFunctionReference(ref, args)
 			end)
-			local rvs = msgpack.unpack(rv)
+			local rvs = msgpack_unpack(rv)
 
 			-- handle async retvals from refs
-			if rvs and type(rvs[1]) == 'table' and rawget(rvs[1], '__cfx_async_retval') and coroutine.running() then
+			if rvs and type(rvs[1]) == 'table' and rawget(rvs[1], '__cfx_async_retval') and coroutine_running() then
 				local p = promise.new()
 
 				rvs[1].__cfx_async_retval(function(r, e)
@@ -852,10 +1048,10 @@ funcref_mt = msgpack.extend({
 					end
 				end)
 
-				return table.unpack(Citizen.Await(p))
+				return table_unpack(Citizen.Await(p))
 			end
 
-			return table.unpack(rvs)
+			return table_unpack(rvs)
 		else
 			return InvokeRpcEvent(tonumber(netSource.source:sub(5)), ref, {...})
 		end
@@ -938,6 +1134,15 @@ local function lazyEventHandler() -- lazy initializer so we don't add an event w
 	lazyEventHandler = function() end
 end
 
+-- Handle an export with multiple return values.
+local function exportProcessResult(resource, k, status, ...)
+	if not status then
+		local result = tostring(select(1, ...))
+		error('An error happened while calling export ' .. k .. ' of resource ' .. resource .. ' (' .. result .. '), see above for details')
+	end
+	return ...
+end
+
 -- invocation bit
 exports = {}
 
@@ -963,14 +1168,8 @@ setmetatable(exports, {
 					end
 				end
 
-				return function(self, ...)
-					local status, result = pcall(exportsCallbackCache[resource][k], ...)
-
-					if not status then
-						error('An error happened while calling export ' .. k .. ' of resource ' .. resource .. ' (' .. result .. '), see above for details')
-					end
-
-					return result
+				return function(self, ...) -- TAILCALL
+					return exportProcessResult(resource, k, pcall(exportsCallbackCache[resource][k], ...))
 				end
 			end,
 
@@ -997,6 +1196,24 @@ if not isDuplicityVersion then
 		RegisterNuiCallbackType(type)
 
 		AddEventHandler('__cfx_nui:' .. type, function(body, resultCallback)
+--[[
+			-- Lua 5.4: Create a to-be-closed variable to monitor the NUI callback handle.
+			local hasCallback = false
+			local _ <close> = defer(function()
+				if not hasCallback then
+					local di = debug_getinfo(callback, 'S')
+					local name = ('function %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
+					Citizen.Trace(("No NUI callback captured: %s\n"):format(name))
+				end
+			end)
+
+			local status, err = pcall(function()
+				callback(body, function(...)
+					hasCallback = true
+					resultCallback(...)
+				end)
+			end)
+--]]			
 			local status, err = pcall(function()
 				callback(body, resultCallback)
 			end)
@@ -1025,7 +1242,7 @@ local function NewStateBag(es)
 		__index = function(_, s)
 			if s == 'set' then
 				return function(_, s, v, r)
-					local payload = msgpack.pack(v)
+					local payload = msgpack_pack(v)
 					SetStateBagValue(es, s, payload, payload:len(), r)
 				end
 			end
@@ -1034,7 +1251,7 @@ local function NewStateBag(es)
 		end,
 		
 		__newindex = function(_, s, v)
-			local payload = msgpack.pack(v)
+			local payload = msgpack_pack(v)
 			SetStateBagValue(es, s, payload, payload:len(), isDuplicityVersion)
 		end
 	})
