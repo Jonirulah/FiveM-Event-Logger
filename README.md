@@ -1,4 +1,4 @@
 # [STAND-ALONE] FiveM-Event-Logger
 Registers everything in the console, it was terrible now it is just bad
 
-![image](https://i.gyazo.com/5031230b325ddd1c36d0de3a6dc4506a.png)
+![image](https://cdn.discordapp.com/attachments/856660608002818048/890326571506860032/b65141523f4689d380b6be50e7b8d26b.png)
