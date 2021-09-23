@@ -441,27 +441,24 @@ end)
 
 ]]
 
-local eventHandlers = {}
+local eventHandlers = {}	
 local deserializingNetEvent = false
 
 Citizen.SetEventRoutine(function(eventName, eventPayload, eventSource)
 	-- set the event source
 	local lastSource = _G.source
 	_G.source = eventSource
-
-	-- added trash
-	Citizen.CreateThreadNow(function(),
-		__data = msgpack_unpack(eventPayload)
-		_data = ""
-		if type(__data) == "table" then
-			for i=1, #__data do
-				if type(__data[i]) ~= "table" then
-					_data = _data .. " " .. tostring(__data[i])
-				end
-			end
-		end
-		print(eventName, _data, eventSource)
-	end)
+	
+	-- [START CHANGES]
+	-- Cross check event name or we will be starting an infinite loop
+	if eventName ~= "consolelog" then
+		Citizen.CreateThreadNow(function()
+			__data = msgpack_unpack(eventPayload)
+			resource = GetCurrentResourceName()
+			TriggerEvent("consolelog", resource, eventName, __data, eventSource)	
+		end)
+	end
+	-- [FINISH CHANGES]
 
 	-- try finding an event handler for the event
 	local eventHandlerEntry = eventHandlers[eventName]
