@@ -1,7 +1,7 @@
 # [STAND-ALONE] FiveM-Event-Logger
 Registers everything in the console, it was terrible now it is just average progressing.
 
-![image](![image](https://user-images.githubusercontent.com/25936173/134549774-6bff7a1a-4495-4a91-868a-c0a410b81469.png))
+![image](https://i.gyazo.com/59d911f6a38356ed00acb82b75c7285e.png))
 
 What it's modified it's on line 454-461
 
