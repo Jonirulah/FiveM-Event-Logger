@@ -1,5 +1,5 @@
 # [STAND-ALONE] FiveM-Event-Logger
-Registers everything in the console, it was terrible now it is just bad
+Registers everything in the console, it was terrible now it is just average progressing.
 
 ![image](![image](https://user-images.githubusercontent.com/25936173/134549774-6bff7a1a-4495-4a91-868a-c0a410b81469.png))
 
