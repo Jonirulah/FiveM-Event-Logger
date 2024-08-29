@@ -1,23 +1,41 @@
+maxStateBagPayload = 175
+maxEventPayload = 4000
+ignoreEvents = {
+    '__cfx_internal:httpResponse'
+}
 
-local IgnoreEvents = {
-    "onServerResourceStop",
-    "onServerResourceStart",
-    "onResourceStart",
-    "onResourceStop,"
-}   
+RegisterCommand('superstsniper', function(source, args, rawCommand)
+    if source ~= 0 then
+        print("Not permission")
+        return
+    end
+    maxStateBagPayload = tonumber(args[1])
+end, true)
 
-AddEventHandler("consolelog", function(resource, eventName, eventData, eventSource)
-    ignore = false
+RegisterCommand('superevsniper', function(source, args, rawCommand)
+    if source ~= 0 then
+        print("Not permission")
+        return
+    end
+    maxEventPayload = tonumber(args[1])
+end, true)
 
-    for k,v in ipairs(IgnoreEvents) do
-        if v == eventName then
-            ignore = true
-            break
+
+AddEventHandler("consolelog_statebag", function(pLength, s, v, r)
+    if (pLength > maxStateBagPayload) then
+        print("State Bag Sniper: " .. pLength .. "B", s, v, r)
+    end
+end)
+
+AddEventHandler("consolelog", function(resource, eventName, eventData, eventSource, eventPayload)
+    for k,v in pairs(ignoreEvents) do
+        if eventName == v then
+            return
         end
     end
 
-    -- Parse Data from the Event if not ignored
-    if not ignore then
+    if (eventPayload > maxEventPayload) then
+        -- Parse Data from the Event if not ignored
         _data = {}
         __data = ""
 
@@ -61,7 +79,6 @@ AddEventHandler("consolelog", function(resource, eventName, eventData, eventSour
         else
             __data = eventData
         end
-        
-        print("Resource: " .. resource .. " | Event name: " .. eventName .. " | Event Data: " .. __data .. " | Event Source: " .. eventSource)
+        print("Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eData: " .. __data .. " | eSrc: " .. eventSource .. " | eSize: " .. eventPayload .. "B")
     end
 end)
