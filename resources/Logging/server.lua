@@ -168,13 +168,13 @@ AddEventHandler("consolelog_client", function(resource, playerId, eventName, eve
     end
 end)
 
-AddEventHandler("consolelog_client_latent", function(resource, playerId, eventName, eventPayload)
+AddEventHandler("consolelog_client_latent", function(resource, playerId, eventName, eventPayload, bps)
     for k,v in pairs(ignoreEvents) do
         if eventName == v then
             return
         end
     end
     if (eventPayload > maxEventPayload) then
-        print("[S->C] ^3Latent ^7Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eSrc: " .. playerId .. " | eSize: " .. eventPayload .. "B")
+        print("[S->C] ^3Latent Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eSrc: " .. playerId .. " | eSize: " .. eventPayload .. "B^7" .. | '| bps: ' .. bps)
     end
 end)
