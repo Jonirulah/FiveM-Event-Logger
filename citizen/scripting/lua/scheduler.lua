@@ -365,7 +365,7 @@ if isDuplicityVersion then
 		Citizen.CreateThreadNow(function()
 			resource = GetCurrentResourceName()
 			local payloadLength = payload:len()
-			TriggerEvent("consolelog_client_latent", resource, playerId, eventName, payloadLength)	
+			TriggerEvent("consolelog_client_latent", resource, playerId, eventName, payloadLength, bps)	
 		end)
 		return TriggerLatentClientEventInternal(eventName, playerId, payload, payload:len(), tonumber(bps))
 	end
