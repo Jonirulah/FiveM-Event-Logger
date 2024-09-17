@@ -74,13 +74,10 @@ AddStateBagChangeHandler(nil, nil, function(bagName, key, value)
     local keyNameLength = #key
 
     if attack then
-        local entity = GetEntityFromStateBagName(bagName)
-        local owner = NetworkGetEntityOwner(entity)
-        local playerData = OSX.GetPlayerFromId(owner)
         if not attackName then
             print("bagName", bagName)
         end
-        print("Possible Attack attempted! | bagNameLength " .. bagNameLength .. "B keyLength " .. keyNameLength .. "B valLength" .. valData .. " TempID:" .. owner .. " UID:" .. playerData['uid'] .. " steam:" .. playerData['steam'] ..  " discord:" .. playerData['discord'] .. " license:" .. playerData['license'])
+        print("Possible Attack attempted! | bagNameLength " .. bagNameLength .. "B keyLength " .. keyNameLength .. "B valLength" .. valData .. " TempID:" .. owner)
         -- DropPlayer(owner, 'Reliable network event overflow!')
         if not shouldDeleteEntities[entity] then
             shouldDeleteEntities[entity] = true
