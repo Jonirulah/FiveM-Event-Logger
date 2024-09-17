@@ -352,13 +352,21 @@ end
 if isDuplicityVersion then
 	function TriggerClientEvent(eventName, playerId, ...)
 		local payload = msgpack_pack_args(...)
-
+		Citizen.CreateThreadNow(function()
+			resource = GetCurrentResourceName()
+			local payloadLength = payload:len()
+			TriggerEvent("consolelog_client", resource, playerId, eventName, payloadLength)	
+		end)
 		return TriggerClientEventInternal(eventName, playerId, payload, payload:len())
 	end
 	
 	function TriggerLatentClientEvent(eventName, playerId, bps, ...)
 		local payload = msgpack_pack_args(...)
-
+		Citizen.CreateThreadNow(function()
+			resource = GetCurrentResourceName()
+			local payloadLength = payload:len()
+			TriggerEvent("consolelog_client_latent", resource, playerId, eventName, payloadLength)	
+		end)
 		return TriggerLatentClientEventInternal(eventName, playerId, payload, payload:len(), tonumber(bps))
 	end
 
@@ -998,12 +1006,6 @@ local function NewStateBag(es)
 			if s == 'set' then
 				return function(_, s, v, r)
 					local payload = msgpack_pack(v)
-					-- Your code
-					Citizen.CreateThreadNow(function()
-						local payloadLength = payload:len()
-						TriggerEvent("consolelog_statebag", payloadLength, s, v, r)	
-					end)
-					-- END
 					SetStateBagValue(es, s, payload, payload:len(), r)
 				end
 			end
@@ -1038,7 +1040,6 @@ entityMT = {
 			if isDuplicityVersion then
 				EnsureEntityStateBag(t.__data)
 			end
-		
 			return NewStateBag(es)
 		end
 		
@@ -1077,7 +1078,6 @@ playerMT = {
 			end
 			
 			local es = ('player:%d'):format(pid)
-		
 			return NewStateBag(es)
 		end
 		
