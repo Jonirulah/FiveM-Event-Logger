@@ -160,8 +160,14 @@ AddEventHandler("consolelog_client", function(resource, playerId, eventName, eve
             return
         end
     end
+    if (eventPayload > maxEventPayload * 5) then
+        print("^1[S->C] [VeryBigEvent!] Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eSrc: " .. playerId .. " | eSize: " .. eventPayload .. "B, ^4think about switching to LatentEvent!")
+        return
+    end
+
     if (eventPayload > maxEventPayload) then
-        print("[S->C] Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eSrc: " .. playerId .. " | eSize: " .. eventPayload .. "B")
+        print("^3[S->C] Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eSrc: " .. playerId .. " | eSize: " .. eventPayload .. "B")
+        return
     end
 end)
 
@@ -172,6 +178,6 @@ AddEventHandler("consolelog_client_latent", function(resource, playerId, eventNa
         end
     end
     if (eventPayload > maxEventPayload) then
-        print("[S->C] ^3Latent Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eSrc: " .. playerId .. " | eSize: " .. eventPayload .. "B^7" .. | '| bps: ' .. bps)
+        print("[S->C] ^4Latent Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eSrc: " .. playerId .. " | eSize: " .. eventPayload .. "B^7" .. '| bps: ' .. bps)
     end
 end)
