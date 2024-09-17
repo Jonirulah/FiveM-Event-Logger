@@ -1,8 +1,11 @@
-maxStateBagPayload = 175
+maxStateBagPayload = 1500
 maxEventPayload = 4000
+maxLogStateBagPayload = 300
 ignoreEvents = {
     '__cfx_internal:httpResponse'
 }
+
+shouldDeleteEntities = {}
 
 RegisterCommand('superstsniper', function(source, args, rawCommand)
     if source ~= 0 then
@@ -12,6 +15,15 @@ RegisterCommand('superstsniper', function(source, args, rawCommand)
     maxStateBagPayload = tonumber(args[1])
 end, true)
 
+RegisterCommand('stsniper', function(source, args, rawCommand)
+    if source ~= 0 then
+        print("Not permission")
+        return
+    end
+    maxLogStateBagPayload = tonumber(args[1])
+end, true)
+
+
 RegisterCommand('superevsniper', function(source, args, rawCommand)
     if source ~= 0 then
         print("Not permission")
@@ -20,8 +32,70 @@ RegisterCommand('superevsniper', function(source, args, rawCommand)
     maxEventPayload = tonumber(args[1])
 end, true)
 
+RegisterCommand('deleteaffected', function(source, args, rawCommand)
+    if source ~= 0 then
+        print("Not permission")
+        return
+    end
+    print("¡¡¡DELETING AFFECTED ENTITIES!!!")
+    for k,v in pairs(shouldDeleteEntities) do
+        if DoesEntityExist(k) then
+            DeleteEntity(k)
+            print("Deleting entity", k)
+        end
+        shouldDeleteEntities[k] = nil
+    end
+end)
+
+AddStateBagChangeHandler(nil, nil, function(bagName, key, value) 
+    local attackName = false
+    local attack = false
+    local valData = value
+    if #key > maxStateBagPayload then
+        attack = true
+    elseif #bagName > maxStateBagPayload then
+        attackName = true
+        attack = true
+    end
+
+    if type(value) == 'table' or type(value) == 'string' then
+        if #value > maxStateBagPayload then
+            attack = true
+        end
+        valData = #value .. 'Bytes'
+    elseif type(value) == 'boolean' then
+        valData = tostring(value)
+    elseif type(value) == 'nil' then
+        valData = 'nil'
+    end
+
+    -- Attack handler
+    local bagNameLength = #bagName
+    local keyNameLength = #key
+
+    if attack then
+        local entity = GetEntityFromStateBagName(bagName)
+        local owner = NetworkGetEntityOwner(entity)
+        local playerData = OSX.GetPlayerFromId(owner)
+        if not attackName then
+            print("bagName", bagName)
+        end
+        print("Possible Attack attempted! | bagNameLength " .. bagNameLength .. "B keyLength " .. keyNameLength .. "B valLength" .. valData .. " TempID:" .. owner .. " UID:" .. playerData['uid'] .. " steam:" .. playerData['steam'] ..  " discord:" .. playerData['discord'] .. " license:" .. playerData['license'])
+        -- DropPlayer(owner, 'Reliable network event overflow!')
+        if not shouldDeleteEntities[entity] then
+            shouldDeleteEntities[entity] = true
+        end
+    -- Just Logging (safety)
+    elseif #key > maxLogStateBagPayload or #bagName > maxLogStateBagPayload then
+        local entity = GetEntityFromStateBagName(bagName)
+        local owner = NetworkGetEntityOwner(entity)
+        print("Logging StateBag: ", bagName, key, valData)
+    end
+end)
 
 AddEventHandler("consolelog_statebag", function(pLength, s, v, r)
+    print("State Bag Sniper: " .. pLength .. "B", s, v, r)
+
     if (pLength > maxStateBagPayload) then
         print("State Bag Sniper: " .. pLength .. "B", s, v, r)
     end
@@ -47,7 +121,6 @@ AddEventHandler("consolelog", function(resource, eventName, eventData, eventSour
         elseif eventSource:sub(1, 12) == 'internal-net' then
             eventSource = "playerJoining " .. eventSource:sub(14) 
         end
-        
 
         -- Table (multiple args)
         if type(eventData) == "table" then
@@ -79,6 +152,29 @@ AddEventHandler("consolelog", function(resource, eventName, eventData, eventSour
         else
             __data = eventData
         end
-        print("Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eData: " .. __data .. " | eSrc: " .. eventSource .. " | eSize: " .. eventPayload .. "B")
+        print("[C->S] Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eData: " .. __data .. " | eSrc: " .. eventSource .. " | eSize: " .. eventPayload .. "B")
+    end
+end)
+
+
+AddEventHandler("consolelog_client", function(resource, playerId, eventName, eventPayload)
+    for k,v in pairs(ignoreEvents) do
+        if eventName == v then
+            return
+        end
+    end
+    if (eventPayload > maxEventPayload) then
+        print("[S->C] Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eSrc: " .. playerId .. " | eSize: " .. eventPayload .. "B")
+    end
+end)
+
+AddEventHandler("consolelog_client_latent", function(resource, playerId, eventName, eventPayload)
+    for k,v in pairs(ignoreEvents) do
+        if eventName == v then
+            return
+        end
+    end
+    if (eventPayload > maxEventPayload) then
+        print("[S->C] ^3Latent ^7Event Sniper: " .. resource .. " | eName: " .. eventName .. " | eSrc: " .. playerId .. " | eSize: " .. eventPayload .. "B")
     end
 end)
